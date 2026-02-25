@@ -3,8 +3,13 @@
 import 'dart:async';
 import 'dart:developer' as dev;
 import 'dart:io' as io;
+import 'dart:typed_data' as typed_data;
 
 import 'package:analyzer/dart/analysis/analysis_context.dart';
+// ignore: implementation_imports
+import 'package:analyzer/src/dart/analysis/byte_store.dart';
+// ignore: implementation_imports
+import 'package:analyzer/src/dart/analysis/file_byte_store.dart';
 import 'package:analyzer/dart/analysis/analysis_context_collection.dart';
 import 'package:analyzer/dart/analysis/context_root.dart';
 import 'package:analyzer/dart/analysis/results.dart';
@@ -405,6 +410,21 @@ class _ClientAnalyzerPlugin extends analyzer_plugin.ServerPlugin {
     this._client, {
     required super.resourceProvider,
   });
+
+  @override
+  ByteStore createByteStore() {
+    final cacheDir = io.Directory(
+      join(io.Directory.systemTemp.path, 'custom_lint_byte_store'),
+    );
+    cacheDir.createSync(recursive: true);
+    var totalBytes = 0;
+    for (final f in cacheDir.listSync(recursive: true)) {
+      if (f is io.File) totalBytes += f.lengthSync();
+    }
+    io.stderr.writeln('[BYTE_STORE] cache dir: ${cacheDir.path}, existing size: ${(totalBytes / 1024 / 1024).toStringAsFixed(1)} MB');
+    final inner = EvictingFileByteStore(cacheDir.path, 1024 * 1024 * 512);
+    return _LoggingByteStore(inner);
+  }
 
   final CustomLintClientChannel _channel;
   final CustomLintPluginClient _client;
@@ -828,16 +848,34 @@ class _ClientAnalyzerPlugin extends analyzer_plugin.ServerPlugin {
   Future<void> analyzeFiles({
     required AnalysisContext analysisContext,
     required List<String> paths,
-  }) {
+  }) async {
     // analyzeFiles reanalyzes all files even if nothing changed by default.
     // We customize the behavior to optimize analysis to be performed only
     // if something changed
-    if (paths.isEmpty) return Future.value();
+    if (paths.isEmpty) return;
 
-    return super.analyzeFiles(
-      analysisContext: analysisContext,
-      paths: paths,
-    );
+    final dartPaths = paths.where((p) => p.endsWith('.dart')).toList();
+    io.stderr.writeln('[CUSTOM_LINT] analyzeFiles: ${paths.length} total, ${dartPaths.length} dart files');
+    final sw = Stopwatch()..start();
+    var analyzed = 0;
+
+    // Sequential — getResolvedUnitResult serializes internally anyway.
+    final fileSw = Stopwatch();
+    for (final path in paths) {
+      fileSw..reset()..start();
+      await analyzeFile(analysisContext: analysisContext, path: path);
+      fileSw.stop();
+      if (path.endsWith('.dart') && fileSw.elapsedMilliseconds > 500) {
+        io.stderr.writeln('[CUSTOM_LINT] SLOW ${fileSw.elapsedMilliseconds}ms: $path');
+      }
+      if (path.endsWith('.dart')) {
+        analyzed++;
+        if (analyzed % 500 == 0) {
+          io.stderr.writeln('[CUSTOM_LINT] $analyzed/${dartPaths.length} dart files in ${sw.elapsed}');
+        }
+      }
+    }
+    io.stderr.writeln('[CUSTOM_LINT] Done: $analyzed dart files in ${sw.elapsed}');
   }
 
   bool _ownsPath(String path) {
@@ -1215,6 +1253,35 @@ class _ClientAnalyzerPlugin extends analyzer_plugin.ServerPlugin {
     await _client._handlePluginShutdown();
     return super.handlePluginShutdown(parameters);
   }
+}
+
+class _LoggingByteStore implements ByteStore {
+  final ByteStore _inner;
+  int _gets = 0;
+  int _hits = 0;
+  int _puts = 0;
+
+  _LoggingByteStore(this._inner);
+
+  @override
+  typed_data.Uint8List? get(String key) {
+    _gets++;
+    final result = _inner.get(key);
+    if (result != null) _hits++;
+    if (_gets % 500 == 0) {
+      io.stderr.writeln('[BYTE_STORE] gets=$_gets hits=$_hits puts=$_puts hitRate=${(_hits * 100 / _gets).toStringAsFixed(1)}%');
+    }
+    return result;
+  }
+
+  @override
+  typed_data.Uint8List putGet(String key, typed_data.Uint8List bytes) {
+    _puts++;
+    return _inner.putGet(key, bytes);
+  }
+
+  @override
+  void release(Iterable<String> keys) => _inner.release(keys);
 }
 
 class _AnalysisErrorListenerDelegate implements DiagnosticListener {
