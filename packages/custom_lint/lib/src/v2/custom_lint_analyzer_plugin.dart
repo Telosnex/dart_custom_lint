@@ -289,27 +289,25 @@ class CustomLintServer {
     if (_closeFuture != null) return _closeFuture;
 
     return _closeFuture = Future(() async {
-      // Cancel pending operations
+      // Cancel pending operations waiting for context roots/client channel.
       await _contextRoots.close();
 
-      // Flushes logs before stopping server.
-      await _runner.wait();
+      final clientChannel = _clientChannel.valueOrNull;
 
       try {
         await Future.wait([
-          _clientChannel.safeFirst
-              .then((clientChannel) => clientChannel?.close()),
+          if (clientChannel != null) clientChannel.close(),
           _clientChannel.close(),
           _requestSubscription.cancel(),
           if (_clientChannelEventsSubscription != null)
             _clientChannelEventsSubscription!.cancel(),
-        ])
-            // Close the connection after previous disposals are done, to make sure
-            // the shutdown request (if any) receives a response
-            .whenComplete(_analyzerPluginClientChannel.close);
+        ]);
       } finally {
-        // Wait for remaining operations to complete
+        // Wait for remaining operations after closing the client channel. Closing
+        // the channel unblocks pending requests waiting on _clientChannel.safeFirst.
         await _runner.wait();
+
+        await _analyzerPluginClientChannel.close();
       }
     })
         // Make sure "close" never throws, so that follow-up dispose logic can continue.

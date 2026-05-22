@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:analyzer_plugin/protocol/protocol.dart';
 import 'package:analyzer_plugin/protocol/protocol_generated.dart';
+import 'package:meta/meta.dart';
 import 'package:path/path.dart';
 import 'package:uuid/uuid.dart';
 
@@ -12,6 +13,10 @@ import '../channels.dart';
 import '../workspace.dart';
 import 'custom_lint_analyzer_plugin.dart';
 import 'protocol.dart';
+
+const _clientShutdownTimeout = Duration(seconds: 2);
+const _clientExitTimeout = Duration(seconds: 2);
+const _socketCloseTimeout = Duration(seconds: 1);
 
 Future<T> _asyncRetry<T>(
   Future<T> Function() cb, {
@@ -28,6 +33,47 @@ Future<T> _asyncRetry<T>(
       // If out of retry, stop
       if (i >= retryCount) rethrow;
     }
+  }
+}
+
+/// Best-effort sends a `plugin.shutdown` request to the client process.
+@visibleForTesting
+Future<void> sendBestEffortPluginShutdown(
+  Future<Response> Function(Request request) sendRequest, {
+  Duration timeout = _clientShutdownTimeout,
+}) async {
+  try {
+    await sendRequest(PluginShutdownParams().toRequest(const Uuid().v4()))
+        .timeout(timeout);
+  } catch (_) {
+    // Shutdown is best-effort. The caller will still close sockets/kill the
+    // process if the client does not respond.
+  }
+}
+
+/// Terminates a custom_lint client process and waits for it to exit.
+@visibleForTesting
+Future<void> terminateCustomLintClientProcess(
+  Process? process, {
+  Duration timeout = _clientExitTimeout,
+}) async {
+  if (process == null) return;
+
+  process.kill();
+
+  try {
+    await process.exitCode.timeout(timeout);
+    return;
+  } on TimeoutException {
+    if (!Platform.isWindows) {
+      process.kill(ProcessSignal.sigkill);
+    }
+  }
+
+  try {
+    await process.exitCode.timeout(timeout);
+  } on TimeoutException {
+    // Nothing more to do. We attempted SIGTERM, and SIGKILL where available.
   }
 }
 
@@ -289,19 +335,31 @@ void main(List<String> args) async {
 
   /// Stops the client, liberating the resources.
   Future<void> close() async {
-    // TODO send shutdown request
+    await sendBestEffortPluginShutdown(sendAnalyzerPluginRequest);
 
     await Future.wait([
       if (_tempDirectory != null) _tempDirectory!.delete(recursive: true),
-      _socket.then((value) => value.close()),
       _serverSocket.close(),
+      _closeSocket(),
       _channel.close(),
       _processFuture.then<void>(
-        (value) => value?.kill(),
+        terminateCustomLintClientProcess,
         // The process wasn't started. No need to do anything.
         onError: (_) {},
       ),
     ]);
+  }
+
+  Future<void> _closeSocket() async {
+    Socket? socket;
+    try {
+      socket = await _socket.timeout(_socketCloseTimeout);
+      await socket.close().timeout(_socketCloseTimeout);
+    } catch (_) {
+      socket?.destroy();
+    } finally {
+      socket?.destroy();
+    }
   }
 }
 
