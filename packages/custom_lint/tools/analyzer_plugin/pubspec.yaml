@@ -9,6 +9,18 @@ environment:
 dependencies:
   custom_lint: 0.8.2
 
+dependency_overrides:
+  custom_lint:
+    git:
+      url: https://github.com/Telosnex/dart_custom_lint.git
+      path: packages/custom_lint
+      ref: main
+  custom_lint_core:
+    git:
+      url: https://github.com/Telosnex/dart_custom_lint.git
+      path: packages/custom_lint_core
+      ref: main
+
 # TODO: If you want to contribute to custom_lint, add a pubspec_overrides.yaml file
 # in this folder, containing the following:
 # dependency_overrides:
