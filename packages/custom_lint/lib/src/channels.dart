@@ -72,16 +72,27 @@ class JsonSocketChannel extends AnalyzerPluginClientChannel {
   JsonSocketChannel(this._socket) {
     // Pipe the socket messages in a broadcast stream
     _subscription = Stream.fromFuture(_socket).asyncExpand((e) => e).listen(
-          _controller.add,
-          onError: _controller.addError,
-          onDone: _controller.close,
-        );
+      (chunk) {
+        try {
+          for (final message in _receiveWithLength(chunk)) {
+            _controller.add(jsonDecode(utf8.decode(message)));
+          }
+        } catch (error, stackTrace) {
+          _controller.addError(error, stackTrace);
+        }
+      },
+      onError: _controller.addError,
+      onDone: _controller.close,
+    );
   }
 
   final Future<Socket> _socket;
 
-  final _controller = StreamController<Uint8List>.broadcast();
-  late StreamSubscription<Object?> _subscription;
+  final _controller = StreamController<Object?>.broadcast();
+  late StreamSubscription<Uint8List> _subscription;
+
+  Uint8List _pendingBytes = Uint8List(0);
+  int? _pendingMessageLength;
 
   /// Send a message while having the first 4 bytes of the message be the length of the message.
   void _sendWithLength(Socket socket, List<int> data) {
@@ -100,41 +111,46 @@ class JsonSocketChannel extends AnalyzerPluginClientChannel {
   /// By sending the length with every message, the receiver can know
   /// where a message ends and another begins.
   Iterable<List<int>> _receiveWithLength(Uint8List input) sync* {
-    final chunk = ByteData.view(input.buffer);
+    final buffer = _pendingBytes.isEmpty
+        ? input
+        : (Uint8List(_pendingBytes.length + input.length)
+          ..setAll(0, _pendingBytes)
+          ..setAll(_pendingBytes.length, input));
 
     var startOffset = 0;
-    var bytesCountNeeded = _lengthBytes;
-    var isReadingMessageLength = true;
 
-    while (startOffset + bytesCountNeeded <= input.length) {
-      if (isReadingMessageLength) {
+    while (true) {
+      final messageLength = _pendingMessageLength;
+      if (messageLength == null) {
+        if (buffer.length - startOffset < _lengthBytes) break;
+
         // Reading the length of the next message.
-        bytesCountNeeded = chunk.getUint32(startOffset);
+        _pendingMessageLength = ByteData.sublistView(
+          buffer,
+          startOffset,
+          startOffset + _lengthBytes,
+        ).getUint32(0);
 
         // We have the message length, now reading the message.
         startOffset += _lengthBytes;
-        isReadingMessageLength = false;
-      } else {
-        // We have the message length, now reading the message.
-        final message = input.sublist(
-          startOffset,
-          startOffset + bytesCountNeeded,
-        );
-        yield message;
-
-        // Reset to reading the length of the next message.
-        startOffset += bytesCountNeeded;
-        bytesCountNeeded = _lengthBytes;
-        isReadingMessageLength = true;
+        continue;
       }
+
+      if (buffer.length - startOffset < messageLength) break;
+
+      // We have the full message.
+      yield buffer.sublist(startOffset, startOffset + messageLength);
+
+      // Reset to reading the length of the next message.
+      startOffset += messageLength;
+      _pendingMessageLength = null;
     }
+
+    _pendingBytes = Uint8List.sublistView(buffer, startOffset);
   }
 
   @override
-  late final Stream<Object?> messages = _controller.stream
-      .expand(_receiveWithLength)
-      .map(utf8.decode)
-      .map<Object?>(jsonDecode);
+  late final Stream<Object?> messages = _controller.stream;
 
   @override
   Future<void> sendJson(Map<String, Object?> json) async {
