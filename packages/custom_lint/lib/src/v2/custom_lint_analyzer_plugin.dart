@@ -336,6 +336,10 @@ class CustomLintServer {
     AnalysisSetContextRootsParams parameters,
   ) =>
       _runner.run(() async {
+        if (_closeFuture != null || _contextRoots.isClosed) {
+          return AnalysisSetContextRootsResult();
+        }
+
         _contextRoots.add(parameters);
 
         await _maybeSpawnCustomLintPlugin(parameters);
@@ -355,6 +359,7 @@ class CustomLintServer {
     }
 
     SocketCustomLintServerToClientChannel? clientChannel;
+    StreamSubscription<CustomLintEvent>? clientChannelEventsSubscription;
 
     try {
       clientChannel = await SocketCustomLintServerToClientChannel.create(
@@ -363,37 +368,55 @@ class CustomLintServer {
         parameters,
         workingDirectory: workingDirectory,
       );
+      if (clientChannel == null) {
+        if (!_clientChannel.isClosed) _clientChannel.add(null);
+        return;
+      }
+
+      // Listening to event before init, to make sure messages during the init are handled.
+      clientChannelEventsSubscription = clientChannel.events.listen(
+        _handleEvent,
+      );
+
+      final configs = await Future.wait(
+        parameters.roots.map(
+          (e) async {
+            final packageConfig = await findPackageConfig(Directory(e.root));
+            if (packageConfig == null) return null;
+
+            return CustomLintConfigs.parse(
+              PhysicalResourceProvider.INSTANCE.getFile(
+                p.join(e.root, 'analysis_options.yaml'),
+              ),
+              packageConfig,
+            );
+          },
+        ),
+      );
+
+      await clientChannel.init(
+        debug: configs.any((e) => e != null && e.debug),
+      );
+
+      if (_closeFuture != null || _clientChannel.isClosed) {
+        await clientChannelEventsSubscription.cancel();
+        unawaited(clientChannel.close());
+        return;
+      }
+
+      _clientChannelEventsSubscription = clientChannelEventsSubscription;
       _clientChannel.add(clientChannel);
-      if (clientChannel == null) return;
     } catch (err, stack) {
+      await clientChannelEventsSubscription?.cancel();
+      if (_closeFuture != null || _clientChannel.isClosed) {
+        final channel = clientChannel;
+        if (channel != null) unawaited(channel.close());
+        return;
+      }
+
       _clientChannel.addError(err, stack);
       rethrow;
     }
-
-    // Listening to event before init, to make sure messages during the init are handled.
-    _clientChannelEventsSubscription = clientChannel.events.listen(
-      _handleEvent,
-    );
-
-    final configs = await Future.wait(
-      parameters.roots.map(
-        (e) async {
-          final packageConfig = await findPackageConfig(Directory(e.root));
-          if (packageConfig == null) return null;
-
-          return CustomLintConfigs.parse(
-            PhysicalResourceProvider.INSTANCE.getFile(
-              p.join(e.root, 'analysis_options.yaml'),
-            ),
-            packageConfig,
-          );
-        },
-      ),
-    );
-
-    await clientChannel.init(
-      debug: configs.any((e) => e != null && e.debug),
-    );
   }
 
   Future<void> _handleEvent(CustomLintEvent event) => _runner.run(() async {

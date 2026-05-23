@@ -165,7 +165,9 @@ class JsonSocketChannel extends AnalyzerPluginClientChannel {
   @override
   Future<void> close() async {
     await Future.wait([
-      _subscription.cancel(),
+      _subscription
+          .cancel()
+          .timeout(const Duration(seconds: 1), onTimeout: () {}),
       _controller.close(),
     ]);
   }

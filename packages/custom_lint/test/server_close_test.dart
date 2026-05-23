@@ -8,6 +8,8 @@ import 'package:custom_lint/src/plugin_delegate.dart';
 import 'package:custom_lint/src/server_isolate_channel.dart';
 import 'package:custom_lint/src/v2/custom_lint_analyzer_plugin.dart';
 import 'package:custom_lint/src/v2/server_to_client_channel.dart';
+import 'package:custom_lint/src/workspace.dart' as workspace;
+import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 
 void main() {
@@ -33,6 +35,56 @@ void main() {
         completes,
       );
       await pendingRequest.timeout(const Duration(milliseconds: 300));
+    });
+
+    test('does not add client channel errors after shutdown starts', () async {
+      final previousRunProcess = workspace.runProcess;
+      addTearDown(() => workspace.runProcess = previousRunProcess);
+
+      final pubGetStarted = Completer<void>();
+      final failPubGet = Completer<void>();
+      workspace.runProcess = (
+        executable,
+        arguments, {
+        workingDirectory,
+        environment,
+        includeParentEnvironment = true,
+        runInShell = false,
+        stdoutEncoding,
+        stderrEncoding,
+      }) async {
+        if (!pubGetStarted.isCompleted) pubGetStarted.complete();
+        await failPubGet.future;
+        return ProcessResult(0, 1, '', 'pub get failed');
+      };
+
+      final channel = ServerIsolateChannel();
+      addTearDown(channel.close);
+
+      final server = await _startServer(channel.receivePort.sendPort);
+      final app = _createProjectWithPlugin();
+
+      await channel.sendRequest(
+        PluginVersionCheckParams('', '', '1.0.0-alpha.0'),
+      );
+
+      final setContextRoots = channel
+          .sendRequest(
+            AnalysisSetContextRootsParams([ContextRoot(app.path, [])]),
+          )
+          .then<void>((_) {}, onError: (_) {});
+
+      await pubGetStarted.future.timeout(const Duration(milliseconds: 300));
+
+      final close = server.close();
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      failPubGet.complete();
+
+      await expectLater(
+        close.timeout(const Duration(seconds: 5)),
+        completes,
+      );
+      await setContextRoots.timeout(const Duration(milliseconds: 300));
     });
 
     test('does not wait for a first client channel during shutdown', () async {
@@ -82,6 +134,66 @@ void main() {
       expect(process.exitCodeCompleted, true);
     });
   });
+}
+
+Directory _createProjectWithPlugin() {
+  final parent =
+      Directory.systemTemp.createTempSync('custom_lint_close_project');
+  addTearDown(() async {
+    if (parent.existsSync()) {
+      await parent.delete(recursive: true);
+    }
+  });
+
+  final plugin = Directory(p.join(parent.path, 'test_lint'))..createSync();
+  File(p.join(plugin.path, 'pubspec.yaml')).writeAsStringSync('''
+name: test_lint
+version: 0.0.1
+publish_to: none
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  custom_lint_builder: any
+''');
+
+  final app = Directory(p.join(parent.path, 'app'))..createSync();
+  File(p.join(app.path, 'pubspec.yaml')).writeAsStringSync('''
+name: app
+version: 0.0.1
+publish_to: none
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dev_dependencies:
+  test_lint:
+    path: ${plugin.path}
+''');
+  File(p.join(app.path, '.dart_tool', 'package_config.json'))
+    ..createSync(recursive: true)
+    ..writeAsStringSync('''
+{
+  "configVersion": 2,
+  "packages": [
+    {
+      "name": "app",
+      "rootUri": "${app.uri}",
+      "packageUri": "lib/",
+      "languageVersion": "3.0"
+    },
+    {
+      "name": "test_lint",
+      "rootUri": "${plugin.uri}",
+      "packageUri": "lib/",
+      "languageVersion": "3.0"
+    }
+  ]
+}
+''');
+
+  return app;
 }
 
 Future<CustomLintServer> _startServer(SendPort sendPort) async {

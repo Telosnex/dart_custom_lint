@@ -124,6 +124,7 @@ class SocketCustomLintServerToClientChannel {
   final PluginVersionCheckParams _version;
   final ServerSocket _serverSocket;
   late final Future<Process?> _processFuture;
+  var _initialized = false;
   final CustomLintWorkspace _workspace;
 
   AnalysisSetContextRootsParams _contextRoots;
@@ -173,6 +174,7 @@ class SocketCustomLintServerToClientChannel {
       sendAnalyzerPluginRequest(_version.toRequest(const Uuid().v4())),
       sendAnalyzerPluginRequest(_contextRoots.toRequest(const Uuid().v4())),
     ]);
+    _initialized = true;
   }
 
   /// Updates the context roots on the client
@@ -335,11 +337,13 @@ void main(List<String> args) async {
 
   /// Stops the client, liberating the resources.
   Future<void> close() async {
-    await sendBestEffortPluginShutdown(sendAnalyzerPluginRequest);
+    if (_initialized) {
+      await sendBestEffortPluginShutdown(sendAnalyzerPluginRequest);
+    }
 
     await Future.wait([
       if (_tempDirectory != null) _tempDirectory!.delete(recursive: true),
-      _serverSocket.close(),
+      _closeServerSocket(),
       _closeSocket(),
       _channel.close(),
       _processFuture.then<void>(
@@ -348,6 +352,12 @@ void main(List<String> args) async {
         onError: (_) {},
       ),
     ]);
+  }
+
+  Future<void> _closeServerSocket() async {
+    try {
+      await _serverSocket.close().timeout(_socketCloseTimeout);
+    } catch (_) {}
   }
 
   Future<void> _closeSocket() async {
